@@ -1,23 +1,20 @@
-import Redis, {
-  Cluster,
-  ClusterNode,
-  ClusterOptions,
-  RedisOptions,
-} from 'ioredis';
+import Redis, { RedisOptions } from 'ioredis';
 
-import type { Cache, Store, Config } from 'cache-manager';
+import type { Cache, Config, Store } from 'cache-manager';
 
 export type RedisCache = Cache<RedisStore>;
 
 export interface RedisStore extends Store {
   readonly isCacheable: (value: unknown) => boolean;
-  get client(): Redis | Cluster;
+
+  get client(): Redis;
 }
 
 const getVal = (value: unknown) => JSON.stringify(value) || '"undefined"';
 
 export class NoCacheableError implements Error {
   name = 'NoCacheableError';
+
   constructor(public message: string) {}
 }
 
@@ -28,8 +25,21 @@ export const avoidNoCacheable = async <T>(p: Promise<T>) => {
     if (!(e instanceof NoCacheableError)) throw e;
   }
 };
+
+async function batchDeletionKeysByPattern(redis: Redis, key: string) {
+  const stream = redis.scanStream({
+    match: key,
+  });
+
+  stream.on('data', function (resultKeys) {
+    if (resultKeys.length) {
+      redis.unlink(resultKeys);
+    }
+  });
+}
+
 function builder(
-  redisCache: Redis | Cluster,
+  redisCache: Redis,
   reset: () => Promise<void>,
   keys: (pattern: string) => Promise<string[]>,
   options?: Config,
@@ -86,6 +96,10 @@ function builder(
       await redisCache.del(args);
     },
     async del(key) {
+      if (key.includes('*')) {
+        await batchDeletionKeysByPattern(redisCache, key);
+      }
+
       await redisCache.del(key);
     },
     ttl: async (key) => redisCache.pttl(key),
@@ -98,27 +112,14 @@ function builder(
   } as RedisStore;
 }
 
-export interface RedisClusterConfig {
-  nodes: ClusterNode[];
-  options?: ClusterOptions;
-}
-
-export async function redisStore(
-  options?: (RedisOptions | { clusterConfig: RedisClusterConfig }) & Config,
-) {
+export async function redisStore(options?: RedisOptions & Config) {
   options ||= {};
-  const redisCache =
-    'clusterConfig' in options
-      ? new Redis.Cluster(
-          options.clusterConfig.nodes,
-          options.clusterConfig.options,
-        )
-      : new Redis(options);
+  const redisCache = new Redis(options);
 
   return redisInsStore(redisCache, options);
 }
 
-export function redisInsStore(redisCache: Redis | Cluster, options?: Config) {
+export function redisInsStore(redisCache: Redis, options?: Config) {
   const reset = async () => {
     await redisCache.flushdb();
   };
